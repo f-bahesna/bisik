@@ -18,6 +18,11 @@ if ! command -v swiftc >/dev/null 2>&1; then
     exit 1
 fi
 
+if [[ -d "$DIR/.git" ]]; then
+    echo "Updating from GitHub ..."
+    git -C "$DIR" pull --ff-only || echo "Warning: could not update, building the local version." >&2
+fi
+
 PYTHON=""
 for candidate in python3.12 python3.13 python3.11 python3.10; do
     if command -v "$candidate" >/dev/null 2>&1; then
@@ -43,13 +48,21 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -x Bisik 2>/dev/null || true
 pkill -f "Bisik.app/Contents/Resources/bisik.py" 2>/dev/null || true
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+# Permissions follow the signing identity, so only a changed identity invalidates them.
+designated_requirement() { codesign -d -r- "$1" 2>&1 | grep '^designated' || true; }
+OLD_REQUIREMENT=""
+[[ -d "$APP" ]] && OLD_REQUIREMENT="$(designated_requirement "$APP")"
 rm -rf "$APP"
 cp -R "$BUILD" "$APP"
 
-# The ad-hoc signature changes with every build, which invalidates earlier permission grants.
-for service in Accessibility ListenEvent Microphone; do
-    tccutil reset "$service" com.bisik.app >/dev/null 2>&1 || true
-done
+if [[ "$OLD_REQUIREMENT" != "$(designated_requirement "$APP")" ]]; then
+    echo "Signing identity changed, resetting Bisik permissions (grant them again when prompted)."
+    for service in Accessibility ListenEvent Microphone; do
+        tccutil reset "$service" com.bisik.app >/dev/null 2>&1 || true
+    done
+else
+    echo "Signing identity unchanged, keeping granted permissions."
+fi
 
 # Make fn a plain key so a double tap does not open the emoji picker or Dictation.
 defaults write com.apple.HIToolbox AppleFnUsageType -int 0
