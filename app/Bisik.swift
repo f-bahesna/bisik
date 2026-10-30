@@ -12,7 +12,7 @@ final class StatusOverlay {
     private let spinner = NSProgressIndicator()
 
     init() {
-        let size = NSSize(width: 230, height: 44)
+        let size = NSSize(width: 280, height: 44)
         panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -45,6 +45,7 @@ final class StatusOverlay {
 
         label.font = .systemFont(ofSize: 14, weight: .medium)
         label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
         label.frame = NSRect(x: 44, y: (size.height - 18) / 2, width: size.width - 56, height: 18)
 
         background.addSubview(dot)
@@ -53,7 +54,7 @@ final class StatusOverlay {
         panel.contentView = background
     }
 
-    func show(_ state: String) {
+    func show(_ state: String, text: String? = nil) {
         switch state {
         case "recording":
             label.stringValue = "Merekam..."
@@ -65,7 +66,7 @@ final class StatusOverlay {
         case "transcribing":
             showSpinner("Memproses...")
         case "setup":
-            showSpinner("Menyiapkan Bisik...")
+            showSpinner(text ?? "Menyiapkan Bisik...")
         default:
             dot.layer?.removeAllAnimations()
             spinner.stopAnimation(nil)
@@ -224,7 +225,7 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: First-launch setup
 
     private static let pythonCandidates: [String] = {
-        let versions = ["3.13", "3.12", "3.11", "3.10"]
+        let versions = ["3.12", "3.13", "3.11", "3.10"]
         let prefixes = ["/opt/homebrew/bin", "/usr/local/bin"]
         return versions.flatMap { version in
             prefixes.map { "\($0)/python\(version)" }
@@ -256,14 +257,20 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let steps: [[String]] = [
             [base, "-m", "venv", venv.path],
             [python.path, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-            [python.path, "-m", "pip", "install", "--quiet", "-r", requirements.path],
+            [python.path, "-m", "pip", "install", "--progress-bar", "off", "-r", requirements.path],
         ]
         DispatchQueue.global().async { [weak self] in
             guard let self else { return }
             var failure: String?
             try? FileManager.default.createDirectory(at: self.supportDir, withIntermediateDirectories: true)
-            for step in steps where failure == nil {
-                if self.run(step) != 0 { failure = step.prefix(4).joined(separator: " ") }
+            for (index, step) in steps.enumerated() where failure == nil {
+                let prefix = "Menyiapkan Bisik (\(index + 1)/\(steps.count))"
+                DispatchQueue.main.async { self.overlay.show("setup", text: "\(prefix)...") }
+                let status = self.run(step) { line in
+                    guard let detail = Self.describe(pipLine: line) else { return }
+                    DispatchQueue.main.async { self.overlay.show("setup", text: "\(prefix) \(detail)") }
+                }
+                if status != 0 { failure = step.prefix(4).joined(separator: " ") }
             }
             _ = self.run(["/usr/bin/defaults", "write", "com.apple.HIToolbox", "AppleFnUsageType", "-int", "0"])
             DispatchQueue.main.async {
@@ -278,12 +285,32 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func run(_ command: [String]) -> Int32 {
+    /// Short overlay text for a pip output line, or nil if the line is not worth showing.
+    private static func describe(pipLine line: String) -> String? {
+        guard line.hasPrefix("Downloading ") else { return nil }
+        let file = line.dropFirst("Downloading ".count)
+        let name = file.prefix { $0 != "-" && $0 != " " }
+        return name.isEmpty ? nil : "- mengunduh \(name)"
+    }
+
+    private func run(_ command: [String], onLine: ((String) -> Void)? = nil) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command[0])
         process.arguments = Array(command.dropFirst())
-        process.standardOutput = logHandle
-        process.standardError = logHandle
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        var buffered = ""
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.logHandle?.write(data)
+            buffered += String(decoding: data, as: UTF8.self)
+            var lines = buffered.components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+            buffered = lines.removeLast()
+            lines.forEach { onLine?($0) }
+        }
+        defer { pipe.fileHandleForReading.readabilityHandler = nil }
         do {
             try process.run()
             process.waitUntilExit()
