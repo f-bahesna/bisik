@@ -1,8 +1,9 @@
 # Bisik
 
-Dikte suara ke teks di macOS, lokal dan offline.
-Tekan fn 2x, bicara, tekan fn sekali lagi, dan teks langsung ditempel ke aplikasi yang sedang aktif.
+Bisik adalah aplikasi dikte suara untuk macOS yang berjalan sepenuhnya di Mac Anda, tanpa internet dan tanpa mengirim suara ke server mana pun.
+Tekan fn 2x untuk mulai merekam, bicara, lalu tekan fn sekali lagi, dan teksnya langsung ditempel ke aplikasi yang sedang aktif.
 Mendukung bahasa Indonesia dan Inggris dengan deteksi bahasa otomatis.
+Ringan karena hanya satu script Python di atas Whisper (MLX), tanpa Xcode atau build yang rumit.
 
 ## Setup
 
@@ -15,6 +16,19 @@ python3.12 -m venv .venv
 ```
 
 Saat pertama kali dijalankan, model Whisper (sekitar 1,6 GB) diunduh otomatis.
+
+## Jalan otomatis saat login
+
+```
+./install.sh
+```
+
+Script ini membuat venv, memasang dependensi, lalu mendaftarkan LaunchAgent `com.bisik.agent`.
+Bisik akan aktif setiap login dan log-nya ada di `~/Library/Logs/bisik.log`.
+Untuk menghentikan dan menghapus LaunchAgent, jalankan `./uninstall.sh`.
+
+Saat jalan lewat LaunchAgent, izin macOS harus diberikan ke binary Python di venv, bukan ke Terminal.
+`install.sh` mencetak path binary yang perlu ditambahkan.
 
 ## Izin macOS
 
