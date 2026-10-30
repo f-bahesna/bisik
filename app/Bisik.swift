@@ -350,11 +350,20 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Engine
 
+    /// Appends to the log so earlier runs stay available for debugging, and starts over past 1 MB.
     private func openLogHandle() {
         guard logHandle == nil else { return }
         try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: nil)
+        let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int) ?? 0
+        if size > 1_000_000 {
+            try? FileManager.default.removeItem(at: logURL)
+        }
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: nil)
+        }
         logHandle = try? FileHandle(forWritingTo: logURL)
+        logHandle?.seekToEndOfFile()
+        logHandle?.write(Data("--- Bisik dimulai \(Date())\n".utf8))
     }
 
     private func startEngine() {

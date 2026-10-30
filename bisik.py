@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import traceback
+from functools import partial
 
 import mlx_whisper
 import numpy as np
@@ -38,7 +39,14 @@ recording = False
 fn_down = False
 last_press = 0.0
 lock = threading.Lock()
-jobs = queue.Queue()
+model_ready = threading.Event()
+# Starting and stopping the microphone must never wait for the model, so they run on separate threads.
+jobs = queue.Queue()  # audio jobs
+model_jobs = queue.Queue()  # warm-up and transcription; MLX streams are bound to the thread that created them
+
+
+def log(message):
+    print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
 
 
 def play(name):
@@ -66,7 +74,9 @@ def start_recording():
         raise
     play("Tink")
     hud("recording")
-    print("Merekam... (tekan fn sekali untuk berhenti)", flush=True)
+    if not model_ready.is_set():
+        log("Model masih dimuat, hasil muncul setelah model siap.")
+    log("Merekam... (tekan fn sekali untuk berhenti)")
 
 
 def stop_recording():
@@ -78,9 +88,9 @@ def stop_recording():
     stream = None
     play("Pop")
     hud("transcribing")
-    print("Berhenti merekam, memproses...", flush=True)
+    log("Berhenti merekam, memproses...")
     audio = np.concatenate(chunks).flatten() if chunks else np.zeros(0, dtype="float32")
-    transcribe_and_paste(audio)
+    model_jobs.put(partial(transcribe_and_paste, audio))
 
 
 def normalize(text):
@@ -96,17 +106,17 @@ def is_hallucination(audio, text):
 def transcribe_and_paste(audio):
     try:
         if len(audio) < SAMPLE_RATE * 0.3:
-            print("Terlalu pendek, diabaikan.")
+            log("Terlalu pendek, diabaikan.")
             return
         if np.abs(audio).max() < SILENCE_PEAK:
-            print("Tidak ada suara terdeteksi.")
+            log("Tidak ada suara terdeteksi.")
             return
         result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE)
         text = result["text"].strip()
         if not text or is_hallucination(audio, text):
-            print("Tidak ada suara terdeteksi.")
+            log("Tidak ada suara terdeteksi.")
             return
-        print(f"[{result.get('language')}] {text}")
+        log(f"[{result.get('language')}] {text}")
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
         paste()
     finally:
@@ -124,7 +134,7 @@ def on_fn_press():
     """Runs inside the event tap callback, so it only queues work and returns at once."""
     global last_press, recording
     now = time.monotonic()
-    print("fn ditekan", flush=True)
+    log("fn ditekan")
     with lock:
         if recording:
             recording = False
@@ -137,10 +147,10 @@ def on_fn_press():
         last_press = now
 
 
-def worker():
-    """One thread runs every audio and model job, because MLX streams are bound to their thread."""
+def worker(job_queue):
+    """Run the jobs of one queue in order on this thread."""
     while True:
-        job = jobs.get()
+        job = job_queue.get()
         try:
             job()
         except Exception:
@@ -162,7 +172,8 @@ def tap_callback(proxy, event_type, event, refcon):
 
 def warm_up():
     mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype="float32"), path_or_hf_repo=MODEL)
-    print("Model siap. Tekan fn 2x untuk mulai merekam.", flush=True)
+    model_ready.set()
+    log("Model siap. Tekan fn 2x untuk mulai merekam.")
 
 
 tap = Quartz.CGEventTapCreate(
@@ -183,13 +194,14 @@ def main():
             "Gagal memantau tombol fn. Beri izin Accessibility dan Input Monitoring "
             "untuk Bisik (atau Terminal jika dijalankan manual) di System Settings > Privacy & Security."
         )
-    print(f"Memuat model {MODEL} ...")
-    threading.Thread(target=worker, daemon=True).start()
-    jobs.put(warm_up)
+    log(f"Memuat model {MODEL} ...")
+    for job_queue in (jobs, model_jobs):
+        threading.Thread(target=worker, args=(job_queue,), daemon=True).start()
+    model_jobs.put(warm_up)
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
-    print("Pemantau tombol fn aktif.", flush=True)
+    log("Pemantau tombol fn aktif.")
     Quartz.CFRunLoopRun()
 
 

@@ -21,9 +21,10 @@ def hud_on(monkeypatch):
 
 
 def run_jobs(bisik):
-    """Run every queued job in order, the way the worker thread would."""
-    while not bisik.jobs.empty():
-        bisik.jobs.get()()
+    """Run every queued job in order, the way the two worker threads would."""
+    for job_queue in (bisik.jobs, bisik.model_jobs):
+        while not job_queue.empty():
+            job_queue.get_nowait()()
 
 
 class TestPlayAndHud:
@@ -76,33 +77,31 @@ class TestAudioCapture:
         stream = bisik.stream
         bisik.chunks[:] = [np.ones((2, 1), dtype="float32"), np.full((3, 1), 2, dtype="float32")]
 
-        with (
-            mock.patch.object(bisik, "play") as play,
-            mock.patch.object(bisik, "transcribe_and_paste") as transcribe,
-        ):
+        with mock.patch.object(bisik, "play") as play:
             bisik.stop_recording()
 
         stream.stop.assert_called_once()
         stream.close.assert_called_once()
         assert bisik.stream is None
         play.assert_called_once_with("Pop")
-        audio = transcribe.call_args.args[0]
-        assert audio.tolist() == [1, 1, 2, 2, 2]
+        job = bisik.model_jobs.get_nowait()
+        assert job.func is bisik.transcribe_and_paste
+        assert job.args[0].tolist() == [1, 1, 2, 2, 2]
         out = capsys.readouterr().out
         assert "@state:transcribing" in out
         assert "Berhenti merekam" in out
 
     def test_stop_recording_without_audio_sends_an_empty_array(self, bisik):
         bisik.stream = mock.MagicMock()
-        with mock.patch.object(bisik, "play"), mock.patch.object(bisik, "transcribe_and_paste") as transcribe:
+        with mock.patch.object(bisik, "play"):
             bisik.stop_recording()
-        assert len(transcribe.call_args.args[0]) == 0
+        assert len(bisik.model_jobs.get_nowait().args[0]) == 0
 
     def test_stop_recording_does_nothing_when_no_stream_was_opened(self, bisik):
         bisik.stream = None
-        with mock.patch.object(bisik, "transcribe_and_paste") as transcribe, mock.patch.object(bisik, "play") as play:
+        with mock.patch.object(bisik, "play") as play:
             bisik.stop_recording()
-        transcribe.assert_not_called()
+        assert bisik.model_jobs.empty()
         play.assert_not_called()
 
 
@@ -281,10 +280,10 @@ class TestFnDetection:
 class TestWorker:
     def test_worker_runs_jobs_until_the_queue_raises(self, bisik):
         ran = []
-        bisik.jobs = mock.Mock()
-        bisik.jobs.get.side_effect = [lambda: ran.append(1), lambda: ran.append(2), KeyboardInterrupt]
+        job_queue = mock.Mock()
+        job_queue.get.side_effect = [lambda: ran.append(1), lambda: ran.append(2), KeyboardInterrupt]
         with pytest.raises(KeyboardInterrupt):
-            bisik.worker()
+            bisik.worker(job_queue)
         assert ran == [1, 2]
 
     def test_a_failing_job_is_logged_and_does_not_kill_the_worker(self, bisik, hud_on, capsys):
@@ -293,10 +292,10 @@ class TestWorker:
         def broken():
             raise ValueError("boom")
 
-        bisik.jobs = mock.Mock()
-        bisik.jobs.get.side_effect = [broken, lambda: ran.append("after"), KeyboardInterrupt]
+        job_queue = mock.Mock()
+        job_queue.get.side_effect = [broken, lambda: ran.append("after"), KeyboardInterrupt]
         with pytest.raises(KeyboardInterrupt):
-            bisik.worker()
+            bisik.worker(job_queue)
 
         captured = capsys.readouterr()
         assert "ValueError: boom" in captured.err
@@ -375,13 +374,17 @@ class TestStartup:
             bisik.main()
         bisik.Quartz.CFRunLoopRun.assert_not_called()
 
-    def test_main_starts_the_worker_queues_warm_up_and_runs_the_loop(self, bisik, capsys):
+    def test_main_starts_both_workers_queues_warm_up_and_runs_the_loop(self, bisik, capsys):
         with mock.patch.object(bisik.threading, "Thread") as thread:
             bisik.main()
 
-        thread.assert_called_once_with(target=bisik.worker, daemon=True)
-        thread.return_value.start.assert_called_once()
-        assert bisik.jobs.get_nowait() is bisik.warm_up
+        assert thread.call_args_list == [
+            mock.call(target=bisik.worker, args=(bisik.jobs,), daemon=True),
+            mock.call(target=bisik.worker, args=(bisik.model_jobs,), daemon=True),
+        ]
+        assert thread.return_value.start.call_count == 2
+        assert bisik.model_jobs.get_nowait() is bisik.warm_up
+        assert bisik.jobs.empty()
         quartz = bisik.Quartz
         quartz.CGEventTapEnable.assert_called_once_with(bisik.tap, True)
         quartz.CFRunLoopAddSource.assert_called_once()
@@ -468,3 +471,88 @@ class TestEndToEndFlow:
         bisik.on_fn_press()
         assert bisik.recording is True
         assert bisik.jobs.get_nowait() is bisik.start_recording
+
+
+class TestRecordingDoesNotWaitForTheModel:
+    """Regression: a double-tap during model warm-up showed nothing for seconds, then replayed taps out of order."""
+
+    def double_tap(self, bisik, start=100.0):
+        for moment in (start, start + 0.1):
+            with mock.patch.object(bisik.time, "monotonic", return_value=moment):
+                bisik.on_fn_press()
+
+    def test_recording_starts_while_the_model_is_still_loading(self, bisik, hud_on, capsys):
+        bisik.model_jobs.put(bisik.warm_up)  # the model is still loading, so this job never ran
+        with mock.patch.object(bisik, "play"):
+            self.double_tap(bisik)
+            while not bisik.jobs.empty():  # only the audio worker runs
+                bisik.jobs.get_nowait()()
+
+        bisik.sd.InputStream.return_value.start.assert_called_once()
+        assert "@state:recording" in capsys.readouterr().out
+        assert bisik.model_jobs.qsize() == 1
+        bisik.mlx_whisper.transcribe.assert_not_called()
+
+    def test_stopping_while_the_model_loads_queues_transcription_behind_it(self, bisik):
+        bisik.model_jobs.put(bisik.warm_up)
+        bisik.stream = mock.MagicMock()
+        bisik.chunks.append(np.full((16000, 1), 0.1, dtype="float32"))
+
+        with mock.patch.object(bisik, "play"):
+            bisik.stop_recording()
+
+        queued = list(bisik.model_jobs.queue)
+        assert queued[0] is bisik.warm_up
+        assert queued[1].func is bisik.transcribe_and_paste
+
+    def test_a_slow_model_job_does_not_delay_starting_or_stopping_the_microphone(self, bisik, hud_on, capsys):
+        """Drive both real worker threads with a warm-up that blocks until released."""
+        import threading
+
+        warm_up_started = threading.Event()
+        release_warm_up = threading.Event()
+        recorded = threading.Event()
+
+        def slow_warm_up():
+            warm_up_started.set()
+            release_warm_up.wait(5)
+
+        bisik.sd.InputStream.return_value.start.side_effect = recorded.set
+        for queue_ in (bisik.jobs, bisik.model_jobs):
+            threading.Thread(target=bisik.worker, args=(queue_,), daemon=True).start()
+        with mock.patch.object(bisik, "play"):
+            bisik.model_jobs.put(slow_warm_up)
+            assert warm_up_started.wait(2)
+
+            self.double_tap(bisik)
+
+            assert recorded.wait(2), "recording must start even though the model is still loading"
+        release_warm_up.set()
+        assert "@state:recording" in capsys.readouterr().out
+
+    def test_the_log_says_when_the_model_is_not_ready_yet(self, bisik, capsys):
+        with mock.patch.object(bisik, "play"):
+            bisik.start_recording()
+        assert "Model masih dimuat" in capsys.readouterr().out
+
+    def test_the_log_stays_quiet_once_the_model_is_ready(self, bisik, capsys):
+        bisik.warm_up()
+        assert bisik.model_ready.is_set()
+        capsys.readouterr()
+        with mock.patch.object(bisik, "play"):
+            bisik.start_recording()
+        out = capsys.readouterr().out
+        assert "Model masih dimuat" not in out
+        assert "Merekam..." in out
+
+
+class TestLogLines:
+    def test_log_lines_start_with_a_clock_time(self, bisik, capsys):
+        with mock.patch.object(bisik.time, "strftime", return_value="09:08:07") as strftime:
+            bisik.log("halo")
+        strftime.assert_called_once_with("%H:%M:%S")
+        assert capsys.readouterr().out == "09:08:07 halo\n"
+
+    def test_state_markers_stay_unprefixed_so_the_app_can_parse_them(self, bisik, hud_on, capsys):
+        bisik.hud("recording")
+        assert capsys.readouterr().out == "@state:recording\n"
