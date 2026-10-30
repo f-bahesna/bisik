@@ -1,9 +1,11 @@
 """Bisik - tekan fn 2x untuk dikte suara ke teks, lokal dan offline."""
 
 import os
+import queue
 import subprocess
 import threading
 import time
+import traceback
 
 import mlx_whisper
 import numpy as np
@@ -23,10 +25,17 @@ recording = False
 fn_down = False
 last_press = 0.0
 lock = threading.Lock()
+jobs = queue.Queue()
 
 
 def play(name):
     subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"])
+
+
+def hud(state):
+    """Tell Bisik.app which overlay to show (recording, transcribing, idle)."""
+    if os.environ.get("BISIK_HUD"):
+        print(f"@state:{state}", flush=True)
 
 
 def on_audio(indata, frames, time_info, status):
@@ -36,35 +45,42 @@ def on_audio(indata, frames, time_info, status):
 def start_recording():
     global stream, recording
     chunks.clear()
-    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
-    stream.start()
-    recording = True
+    try:
+        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
+        stream.start()
+    except Exception:
+        recording = False
+        raise
     play("Tink")
-    print("Merekam... (tekan fn sekali untuk berhenti)")
+    hud("recording")
+    print("Merekam... (tekan fn sekali untuk berhenti)", flush=True)
 
 
 def stop_recording():
-    global stream, recording
     stream.stop()
     stream.close()
-    recording = False
     play("Pop")
+    hud("transcribing")
+    print("Berhenti merekam, memproses...", flush=True)
     audio = np.concatenate(chunks).flatten() if chunks else np.zeros(0, dtype="float32")
-    threading.Thread(target=transcribe_and_paste, args=(audio,), daemon=True).start()
+    transcribe_and_paste(audio)
 
 
 def transcribe_and_paste(audio):
-    if len(audio) < SAMPLE_RATE * 0.3:
-        print("Terlalu pendek, diabaikan.")
-        return
-    result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE)
-    text = result["text"].strip()
-    if not text:
-        print("Tidak ada suara terdeteksi.")
-        return
-    print(f"[{result.get('language')}] {text}")
-    subprocess.run(["pbcopy"], input=text.encode(), check=True)
-    paste()
+    try:
+        if len(audio) < SAMPLE_RATE * 0.3:
+            print("Terlalu pendek, diabaikan.")
+            return
+        result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE)
+        text = result["text"].strip()
+        if not text:
+            print("Tidak ada suara terdeteksi.")
+            return
+        print(f"[{result.get('language')}] {text}")
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        paste()
+    finally:
+        hud("idle")
 
 
 def paste():
@@ -75,16 +91,31 @@ def paste():
 
 
 def on_fn_press():
-    global last_press
+    """Runs inside the event tap callback, so it only queues work and returns at once."""
+    global last_press, recording
     now = time.monotonic()
+    print("fn ditekan", flush=True)
     with lock:
         if recording:
-            stop_recording()
+            recording = False
+            jobs.put(stop_recording)
         elif now - last_press <= DOUBLE_TAP_WINDOW:
-            start_recording()
+            recording = True
+            jobs.put(start_recording)
             last_press = 0.0
             return
         last_press = now
+
+
+def worker():
+    """One thread runs every audio and model job, because MLX streams are bound to their thread."""
+    while True:
+        job = jobs.get()
+        try:
+            job()
+        except Exception:
+            traceback.print_exc()
+            hud("idle")
 
 
 def tap_callback(proxy, event_type, event, refcon):
@@ -101,7 +132,7 @@ def tap_callback(proxy, event_type, event, refcon):
 
 def warm_up():
     mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype="float32"), path_or_hf_repo=MODEL)
-    print("Model siap. Tekan fn 2x untuk mulai merekam.")
+    print("Model siap. Tekan fn 2x untuk mulai merekam.", flush=True)
 
 
 tap = Quartz.CGEventTapCreate(
@@ -115,16 +146,20 @@ tap = Quartz.CGEventTapCreate(
 
 
 def main():
-    if tap is None:
+    # Without Input Monitoring the tap is still created but never receives key events,
+    # so exit and let Bisik.app retry until the permission is granted.
+    if tap is None or not Quartz.CGPreflightListenEventAccess():
         raise SystemExit(
             "Gagal memantau tombol fn. Beri izin Accessibility dan Input Monitoring "
-            "untuk Terminal di System Settings > Privacy & Security."
+            "untuk Bisik (atau Terminal jika dijalankan manual) di System Settings > Privacy & Security."
         )
     print(f"Memuat model {MODEL} ...")
-    threading.Thread(target=warm_up, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
+    jobs.put(warm_up)
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
+    print("Pemantau tombol fn aktif.", flush=True)
     Quartz.CFRunLoopRun()
 
 
