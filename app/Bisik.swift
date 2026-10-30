@@ -157,6 +157,7 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             entry.target = self
             entry.representedObject = permission.pane
         }
+        menu.addItem(withTitle: "Izin tidak sesuai? Atur ulang...", action: #selector(resetPermissions), keyEquivalent: "").target = self
         menu.addItem(.separator())
         let login = menu.addItem(withTitle: "Buka saat login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
@@ -188,6 +189,25 @@ final class BisikApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let pane = sender.representedObject as? String,
               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// A toggle can look enabled in System Settings while macOS ties it to an older build of the app.
+    /// Resetting removes that stale entry so the permission prompts appear again.
+    @objc private func resetPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
+        let confirm = NSAlert()
+        confirm.messageText = "Atur ulang izin Bisik?"
+        confirm.informativeText = "Entri izin lama dihapus dan macOS akan meminta Microphone, Accessibility, dan Input Monitoring lagi. Nyalakan toggle \"Bisik\" saat diminta."
+        confirm.addButton(withTitle: "Atur Ulang")
+        confirm.addButton(withTitle: "Batal")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.bisik.app"
+        for service in ["Accessibility", "ListenEvent", "Microphone"] {
+            _ = run(["/usr/bin/tccutil", "reset", service, bundleID])
+        }
+        requestPermissions()
+        engine?.terminate()  // The termination handler starts a fresh engine that rechecks the permissions.
     }
 
     @objc private func toggleLogin() {

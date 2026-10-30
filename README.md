@@ -50,9 +50,9 @@ Penyebabnya, Bisik belum ditandatangani dengan Apple Developer ID, jadi macOS me
 
 Cara mengatasinya jika Anda memakai `.dmg`:
 
-1. Klik ikon mikrofon di menu bar, lalu klik baris izin yang bertanda "BELUM diizinkan" untuk membuka panel yang tepat.
-2. Di Accessibility dan Input Monitoring, pilih entri "Bisik" lalu klik `-` untuk menghapusnya.
-3. Keluar dari Bisik dan buka lagi, lalu nyalakan toggle "Bisik" saat diminta dan klik Allow pada popup Microphone.
+1. Klik ikon mikrofon di menu bar, lalu pilih "Izin tidak sesuai? Atur ulang...". Ini menghapus entri izin lama dan meminta izin dari awal.
+2. Nyalakan toggle "Bisik" di Accessibility dan Input Monitoring saat diminta, dan klik Allow pada popup Microphone.
+3. Jika menu itu belum ada di versi Anda, klik baris izin yang bertanda "BELUM diizinkan" untuk membuka panelnya, pilih entri "Bisik" lalu klik `-`, dan buka Bisik lagi.
 
 Bisik mencoba lagi sendiri sampai izin diberikan, jadi tidak perlu restart setelah itu.
 
