@@ -1,7 +1,9 @@
 #!/bin/bash
 # Compile Bisik.app into build/Bisik.app.
 # The app is signed with a local self-signed certificate so its identity, and therefore the
-# macOS permissions granted to it, stay the same across builds. Falls back to an ad-hoc signature.
+# macOS permissions granted to it, stay the same across builds. This script never changes
+# certificate trust settings: the user trusts the certificate once, as described in the README.
+# Without that, it falls back to an ad-hoc signature.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,7 +22,6 @@ fi
 ensure_identity() {
     if [[ -f "$KEYCHAIN" ]] && security find-certificate -c "$IDENTITY" "$KEYCHAIN" >/dev/null 2>&1; then
         security unlock-keychain -p "" "$KEYCHAIN"
-        trust_identity
         return 0
     fi
 
@@ -50,20 +51,6 @@ EOF
     security import "$tmp/identity.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN" >/dev/null
     rm -rf "$tmp"
-    trust_identity
-}
-
-# codesign only accepts a self-signed certificate that is trusted for code signing.
-# This asks for the login password once, and only changes trust for this one certificate.
-trust_identity() {
-    if security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$IDENTITY"; then
-        return 0
-    fi
-    local cert
-    cert="$(mktemp)"
-    security find-certificate -c "$IDENTITY" -p "$KEYCHAIN" > "$cert"
-    security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$cert"
-    rm -f "$cert"
 }
 
 rm -rf "$BUILD"
@@ -77,6 +64,7 @@ if ensure_identity && codesign --force --deep --sign "$IDENTITY" --keychain "$KE
 else
     echo "Warning: could not sign with a local certificate, using an ad-hoc signature." >&2
     echo "Permissions must be granted again after every build." >&2
+    echo "To keep them, trust the certificate once (see README, section \"Izin hilang setelah update\")." >&2
     codesign --force --deep --sign - "$BUILD"
 fi
 echo "Built $BUILD"
