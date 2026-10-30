@@ -95,6 +95,40 @@ Log ada di `~/Library/Logs/bisik.log`.
 
 Model yang sudah diunduh tetap ada di `~/.cache/huggingface`.
 
+## Pengujian
+
+Pasang dependensi pengembangan sekali.
+
+```
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+```
+
+Tes unit memakai mock untuk macOS dan audio, jadi cepat dan tidak butuh mikrofon atau model.
+Coverage harus minimal 90% (saat ini 100% untuk `bisik.py`).
+
+```
+.venv/bin/python -m pytest --cov=bisik
+```
+
+Tes integrasi memakai model Whisper asli dan suara dari `say` (Inggris dan Indonesia), termasuk keheningan dan derau ruangan.
+Model harus sudah diunduh, dan tes dilewati otomatis jika model atau suara tidak tersedia.
+
+```
+.venv/bin/python -m pytest -m integration
+```
+
+Pemeriksaan gaya dan kualitas lainnya:
+
+```
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+shellcheck *.sh
+swiftc -swift-version 5 -warnings-as-errors app/Bisik.swift -o /tmp/bisik-check
+```
+
+Peluncur Swift (`app/Bisik.swift`) belum punya tes otomatis karena sebagian besar berupa UI AppKit dan izin macOS.
+Bagian itu baru diperiksa lewat kompilasi tanpa peringatan dan pengujian manual.
+
 ## Konfigurasi
 
 - `BISIK_MODEL`: repo model MLX Whisper, default `mlx-community/whisper-large-v3-turbo`.

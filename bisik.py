@@ -2,6 +2,7 @@
 
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -9,8 +10,8 @@ import traceback
 
 import mlx_whisper
 import numpy as np
-import sounddevice as sd
 import Quartz
+import sounddevice as sd
 
 MODEL = os.environ.get("BISIK_MODEL", "mlx-community/whisper-large-v3-turbo")
 LANGUAGE = os.environ.get("BISIK_LANGUAGE") or None  # None = auto-detect (id/en)
@@ -18,6 +19,18 @@ SAMPLE_RATE = 16000
 DOUBLE_TAP_WINDOW = 0.4
 FN_MASK = Quartz.kCGEventFlagMaskSecondaryFn
 KEYCODE_V = 9
+SILENCE_PEAK = 0.002  # a quieter signal means the microphone delivered nothing at all
+QUIET_RMS = 0.01  # below this level Whisper tends to invent a stock phrase
+# Phrases Whisper writes for silence or room noise, compared after lowercasing and removing punctuation.
+HALLUCINATIONS = {
+    "thank you",
+    "thank you for watching",
+    "thanks for watching",
+    "you",
+    "bye",
+    "terima kasih",
+    "terima kasih telah menonton",
+}
 
 chunks = []
 stream = None
@@ -57,8 +70,12 @@ def start_recording():
 
 
 def stop_recording():
+    global stream
+    if stream is None:
+        return  # start_recording failed, so there is nothing to stop
     stream.stop()
     stream.close()
+    stream = None
     play("Pop")
     hud("transcribing")
     print("Berhenti merekam, memproses...", flush=True)
@@ -66,14 +83,27 @@ def stop_recording():
     transcribe_and_paste(audio)
 
 
+def normalize(text):
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
+
+
+def is_hallucination(audio, text):
+    """True when quiet audio produced one of Whisper's stock phrases instead of real speech."""
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    return rms < QUIET_RMS and normalize(text) in HALLUCINATIONS
+
+
 def transcribe_and_paste(audio):
     try:
         if len(audio) < SAMPLE_RATE * 0.3:
             print("Terlalu pendek, diabaikan.")
             return
+        if np.abs(audio).max() < SILENCE_PEAK:
+            print("Tidak ada suara terdeteksi.")
+            return
         result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE)
         text = result["text"].strip()
-        if not text:
+        if not text or is_hallucination(audio, text):
             print("Tidak ada suara terdeteksi.")
             return
         print(f"[{result.get('language')}] {text}")
