@@ -5,6 +5,9 @@ Tekan fn 2x untuk mulai merekam, bicara, lalu tekan fn sekali lagi, dan teksnya 
 Mendukung bahasa Indonesia dan Inggris dengan deteksi bahasa otomatis.
 Ringan karena hanya satu script Python di atas Whisper (MLX), tanpa Xcode atau build yang rumit.
 
+Ingin ikut berkontribusi, termasuk membawa Bisik ke Windows?
+Lihat [rencana pengembangan](#rencana-pengembangan).
+
 ## Instalasi
 
 Butuh Mac Apple Silicon dan Python 3.10 sampai 3.13 (`brew install python@3.12`).
@@ -94,6 +97,81 @@ Log ada di `~/Library/Logs/bisik.log`.
 ```
 
 Model yang sudah diunduh tetap ada di `~/.cache/huggingface`.
+
+## Rencana pengembangan
+
+Daftar ini terbuka untuk kontributor.
+Centang item yang selesai di pull request Anda.
+Item bertanda **(mudah)** cocok untuk kontributor baru.
+
+### Dukungan Windows (prioritas)
+
+Saat ini Bisik hanya berjalan di macOS karena sebagian besar bagiannya memakai API Apple.
+Tabel berikut memetakan apa yang perlu diganti.
+
+| Bagian | Sekarang (macOS) | Dibutuhkan di Windows |
+| --- | --- | --- |
+| Transkripsi | `mlx-whisper`, khusus Apple Silicon | `faster-whisper` atau `whisper.cpp` (CPU atau CUDA) |
+| Tombol pintas | Event tap Quartz untuk fn 2x | Windows tidak meneruskan tombol Fn ke aplikasi, jadi pilih tombol lain (misalnya Ctrl atau Right Alt 2x) lewat hook global |
+| Tempel teks | `pbcopy` lalu Cmd+V lewat Quartz | Clipboard lalu Ctrl+V lewat `SendInput` atau `pynput` |
+| Rekam audio | `sounddevice` | Dipakai apa adanya, sudah lintas platform |
+| Suara umpan balik | `afplay` | `winsound` |
+| Overlay dan menu | App Swift/AppKit (`app/Bisik.swift`) | Ikon tray dan overlay, misalnya `pystray` dengan Tkinter atau Qt, atau app .NET |
+| Izin | Microphone, Accessibility, Input Monitoring | Umumnya hanya izin mikrofon |
+| Jalan saat login | LaunchAgent dan `SMAppService` | Folder Startup atau Task Scheduler |
+| Pemasangan | `.dmg` | Installer (PyInstaller dengan Inno Setup atau MSI) |
+| Tes dan CI | pytest di macOS, tes integrasi memakai `say` | GitHub Actions `windows-latest`, suara uji lewat SAPI |
+
+Urutan pengerjaan yang disarankan:
+
+- [ ] Pisahkan `bisik.py` menjadi backend per platform (hotkey, tempel, suara, overlay) di balik antarmuka yang sama, tanpa mengubah perilaku di macOS.
+- [ ] Pilih dan implementasikan tombol pintas pengganti fn 2x untuk Windows.
+- [ ] Tambah backend transkripsi non-Apple (`faster-whisper`) yang dipilih otomatis sesuai platform.
+- [ ] Ikon tray dan overlay status (merekam, memproses) di Windows.
+- [ ] Clipboard dan tempel teks di Windows.
+- [ ] Jalan saat login dan installer Windows.
+- [ ] CI Windows yang menjalankan tes unit.
+
+Rancangan backend yang sama juga membuka jalan untuk Linux.
+
+### Pengalaman pakai
+
+- [ ] Pilih bahasa dan model dari menu **(mudah)**. Sekarang hanya lewat variabel lingkungan `BISIK_MODEL` dan `BISIK_LANGUAGE`.
+- [ ] Kembalikan isi clipboard sebelumnya setelah menempel **(mudah)**. Sekarang transkrip menimpa clipboard.
+- [ ] Batas durasi rekaman **(mudah)**. Audio disimpan di memori tanpa batas.
+- [ ] Status "Memuat model..." di overlay dan progres unduhan model. Sekarang hanya terlihat di log.
+- [ ] Mode tahan tombol (push-to-talk) sebagai alternatif double-tap.
+- [ ] Batalkan rekaman dengan Esc.
+- [ ] Pilih mikrofon.
+- [ ] Riwayat transkrip di menu.
+- [ ] Teks antarmuka dalam beberapa bahasa. Sekarang tulisan Indonesia tertanam di kode.
+
+### Akurasi
+
+- [ ] Deteksi suara (VAD) sungguhan sebagai pengganti heuristik volume dan daftar frasa karangan. Batasan yang diketahui: bisikan "thank you" yang sangat pelan ikut dibuang.
+- [ ] Kosakata kustom dan koreksi hasil, misalnya nama, singkatan, dan tanda baca otomatis.
+- [ ] Penanganan campuran Indonesia dan Inggris dalam satu kalimat. Sekarang bahasa dideteksi per rekaman.
+- [ ] Transkripsi bertahap saat masih bicara.
+- [ ] Mode terjemahan.
+
+### Kekokohan
+
+- [ ] Putuskan perilaku ketukan fn yang menghentikan rekaman. Sekarang ketukan itu dihitung sebagai ketukan pertama double-tap, sehingga satu ketukan lagi dalam 0,4 detik memulai rekaman baru. Perilaku ini dikunci oleh tes `test_the_stop_tap_counts_as_the_first_tap_of_a_new_double_tap`.
+- [ ] Pulihkan status fn yang tersangkut jika event lepas tombol terlewat saat event tap dinonaktifkan sistem.
+
+### Rilis dan kualitas
+
+- [ ] CI di GitHub Actions: `ruff`, `pytest` dengan coverage minimal 90%, `shellcheck`, dan kompilasi Swift **(mudah)**.
+- [ ] Tandatangani dan notarisasi dengan Apple Developer ID, agar izin bertahan lintas update dan peringatan "unidentified developer" hilang.
+- [ ] Tes otomatis untuk peluncur Swift. Sekarang hanya kompilasi tanpa peringatan dan uji manual.
+- [ ] Distribusi lewat Homebrew cask.
+- [ ] Pembaruan otomatis atau notifikasi versi baru.
+
+### Cara berkontribusi
+
+1. Fork repo ini lalu buat branch dari `main`.
+2. Kerjakan satu item, tambahkan tes, dan pastikan semua pemeriksaan di bagian [Pengujian](#pengujian) lolos.
+3. Buka pull request yang menyebut item to-do yang Anda kerjakan.
 
 ## Pengujian
 
