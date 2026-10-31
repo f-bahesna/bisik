@@ -20,6 +20,7 @@ SAMPLE_RATE = 16000
 DOUBLE_TAP_WINDOW = 0.4
 FN_MASK = Quartz.kCGEventFlagMaskSecondaryFn
 KEYCODE_V = 9
+STOP_TIMEOUT = 2.0  # CoreAudio can deadlock while closing a stream, so never wait longer than this
 SILENCE_PEAK = 0.002  # a quieter signal means the microphone delivered nothing at all
 QUIET_RMS = 0.01  # below this level Whisper tends to invent a stock phrase
 # Phrases Whisper writes for silence or room noise, compared after lowercasing and removing punctuation.
@@ -79,13 +80,24 @@ def start_recording():
     log("Merekam... (tekan fn sekali untuk berhenti)")
 
 
+def close_stream(old):
+    try:
+        old.stop()
+        old.close()
+    except Exception:
+        traceback.print_exc()
+
+
 def stop_recording():
     global stream
     if stream is None:
         return  # start_recording failed, so there is nothing to stop
-    stream.stop()
-    stream.close()
+    closer = threading.Thread(target=close_stream, args=(stream,), daemon=True)
     stream = None
+    closer.start()
+    closer.join(STOP_TIMEOUT)
+    if closer.is_alive():
+        log("Menutup mikrofon macet, lanjut memproses audio yang sudah terekam.")
     play("Pop")
     hud("transcribing")
     log("Berhenti merekam, memproses...")

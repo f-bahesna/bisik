@@ -97,6 +97,20 @@ class TestAudioCapture:
             bisik.stop_recording()
         assert len(bisik.model_jobs.get_nowait().args[0]) == 0
 
+    def test_a_microphone_that_hangs_on_close_does_not_block_transcription(self, bisik, monkeypatch, capsys):
+        monkeypatch.setattr(bisik, "STOP_TIMEOUT", 0.05)
+        release = bisik.threading.Event()
+        bisik.stream = mock.MagicMock()
+        bisik.stream.stop.side_effect = lambda: release.wait(5)
+        bisik.chunks[:] = [np.ones((16000, 1), dtype="float32")]
+        try:
+            bisik.stop_recording()
+            assert bisik.stream is None
+            assert not bisik.model_jobs.empty()
+            assert "macet" in capsys.readouterr().out
+        finally:
+            release.set()
+
     def test_stop_recording_does_nothing_when_no_stream_was_opened(self, bisik):
         bisik.stream = None
         with mock.patch.object(bisik, "play") as play:
