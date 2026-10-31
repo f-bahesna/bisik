@@ -32,7 +32,17 @@ HALLUCINATIONS = {
     "bye",
     "terima kasih",
     "terima kasih telah menonton",
+    "selamat menikmati",
+    "sampai jumpa",
+    "sampai jumpa lagi",
+    "sampai jumpa di video berikutnya",
+    "jangan lupa subscribe",
+    "please subscribe",
+    "see you next time",
+    "see you in the next video",
 }
+MAX_CLOSING_WORDS = 8
+TRAILING_QUIET_RATIO = 0.5  # a closing phrase this much quieter than the speech before it was not spoken
 
 chunks = []
 stream = None
@@ -111,8 +121,27 @@ def normalize(text):
 
 def is_hallucination(audio, text):
     """True when quiet audio produced one of Whisper's stock phrases instead of real speech."""
-    rms = float(np.sqrt(np.mean(np.square(audio))))
-    return rms < QUIET_RMS and normalize(text) in HALLUCINATIONS
+    return rms(audio) < QUIET_RMS and normalize(text) in HALLUCINATIONS
+
+
+def rms(audio):
+    return float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+
+
+def strip_trailing_hallucination(audio, result):
+    """Remove a stock closing phrase Whisper appended after the speech, judged by how quiet its audio is."""
+    text = result["text"].strip()
+    words = [w for segment in result.get("segments") or [] for w in segment.get("words") or []]
+    for count in range(min(len(words) - 1, MAX_CLOSING_WORDS), 0, -1):
+        tail = "".join(w["word"] for w in words[-count:])
+        if normalize(tail) not in HALLUCINATIONS:
+            continue
+        start = int(words[-count]["start"] * SAMPLE_RATE)
+        speech = rms(audio[:start])
+        if rms(audio[start:]) < max(QUIET_RMS, TRAILING_QUIET_RATIO * speech) and text.endswith(tail.strip()):
+            log(f"Frasa penutup dibuang: {tail.strip()}")
+            return text[: len(text) - len(tail.strip())].strip()
+    return text
 
 
 def transcribe_and_paste(audio):
@@ -123,11 +152,12 @@ def transcribe_and_paste(audio):
         if np.abs(audio).max() < SILENCE_PEAK:
             log("Tidak ada suara terdeteksi.")
             return
-        result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE)
+        result = mlx_whisper.transcribe(audio, path_or_hf_repo=MODEL, language=LANGUAGE, word_timestamps=True)
         text = result["text"].strip()
         if not text or is_hallucination(audio, text):
             log("Tidak ada suara terdeteksi.")
             return
+        text = strip_trailing_hallucination(audio, result)
         log(f"[{result.get('language')}] {text}")
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
         paste()

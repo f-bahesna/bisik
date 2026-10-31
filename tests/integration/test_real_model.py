@@ -139,3 +139,22 @@ def test_quiet_speech_is_still_transcribed(bisik, tmp_path, gain):
     copied = run.call_args.kwargs["input"].decode().lower()
     assert "hello" in copied
     assert "dictation" in copied
+
+
+@pytest.mark.parametrize(
+    ("voice", "closing"),
+    [("Damayanti", "Terima kasih telah menonton"), ("Damayanti", "Selamat menikmati"), ("Samantha", "Thanks for watching")],
+)
+def test_a_quiet_closing_phrase_after_the_speech_is_not_pasted(bisik, tmp_path, voice, closing):
+    """Regression: Whisper adds a stock closing phrase after the speech that the user never said."""
+    if voice not in voices():
+        pytest.skip(f"voice {voice} is not installed")
+    sentence = "Hello, this is a test of the dictation app." if voice == "Samantha" else "Ini adalah percobaan aplikasi dikte suara."
+    audio = np.concatenate([speak(tmp_path, voice, sentence), np.zeros(8000, dtype="float32"), speak(tmp_path, voice, closing) * 0.01])
+
+    with mock.patch.object(bisik.subprocess, "run") as run, mock.patch.object(bisik, "paste"):
+        bisik.transcribe_and_paste(audio)
+
+    copied = run.call_args.kwargs["input"].decode().lower()
+    assert closing.lower() not in copied, copied
+    assert "percobaan" in copied or "dictation" in copied

@@ -143,7 +143,7 @@ class TestTranscribeAndPaste:
             bisik.transcribe_and_paste(self.SECOND)
 
         bisik.mlx_whisper.transcribe.assert_called_once_with(
-            self.SECOND, path_or_hf_repo=bisik.MODEL, language=bisik.LANGUAGE
+            self.SECOND, path_or_hf_repo=bisik.MODEL, language=bisik.LANGUAGE, word_timestamps=True
         )
         run.assert_called_once_with(["pbcopy"], input=b"Halo dunia", check=True)
         paste.assert_called_once()
@@ -228,6 +228,45 @@ class TestSilenceAndHallucinations:
     )
     def test_normalize_ignores_case_and_punctuation(self, bisik, text, expected):
         assert bisik.normalize(text) == expected
+
+
+class TestTrailingHallucination:
+    SPEECH = np.full(16000 * 3, 0.1, dtype="float32")
+    QUIET_TAIL = np.full(16000 * 2, 0.004, dtype="float32")
+
+    def result(self, closing):
+        """A transcription whose last words start at second 3, where the quiet tail begins."""
+        spoken = [{"word": " Tulis", "start": 0.0, "end": 1.0}, {"word": " ulang", "start": 1.0, "end": 2.0}]
+        extra = [
+            {"word": f" {w}", "start": 3.0 + i * 0.3, "end": 3.3 + i * 0.3} for i, w in enumerate(closing.split())
+        ]
+        text = "Tulis ulang " + closing
+        return {"text": text, "language": "id", "segments": [{"words": spoken + extra}]}
+
+    def run(self, bisik, audio, result):
+        bisik.mlx_whisper.transcribe.return_value = result
+        with mock.patch.object(bisik, "paste"), mock.patch.object(bisik.subprocess, "run") as run:
+            bisik.transcribe_and_paste(audio)
+        return run
+
+    @pytest.mark.parametrize("closing", ["Terima kasih telah menonton!", "selamat menikmati", "Thanks for watching."])
+    def test_a_quiet_closing_phrase_is_removed(self, bisik, closing):
+        run = self.run(bisik, np.concatenate([self.SPEECH, self.QUIET_TAIL]), self.result(closing))
+        run.assert_called_once_with(["pbcopy"], input=b"Tulis ulang", check=True)
+
+    def test_a_closing_phrase_spoken_at_the_same_volume_is_kept(self, bisik):
+        loud_tail = np.full(16000 * 2, 0.1, dtype="float32")
+        run = self.run(bisik, np.concatenate([self.SPEECH, loud_tail]), self.result("terima kasih"))
+        run.assert_called_once_with(["pbcopy"], input=b"Tulis ulang terima kasih", check=True)
+
+    def test_text_without_word_timings_is_left_alone(self, bisik):
+        result = {"text": "Tulis ulang terima kasih telah menonton", "language": "id"}
+        run = self.run(bisik, np.concatenate([self.SPEECH, self.QUIET_TAIL]), result)
+        run.assert_called_once_with(["pbcopy"], input=b"Tulis ulang terima kasih telah menonton", check=True)
+
+    def test_word_timestamps_are_requested_from_the_model(self, bisik):
+        self.run(bisik, self.SPEECH, {"text": "Halo", "language": "id"})
+        assert bisik.mlx_whisper.transcribe.call_args.kwargs["word_timestamps"] is True
 
 
 class TestPaste:
