@@ -18,6 +18,7 @@ MODEL = os.environ.get("BISIK_MODEL", "mlx-community/whisper-large-v3-turbo")
 LANGUAGE = os.environ.get("BISIK_LANGUAGE") or None  # None = auto-detect (id/en)
 SAMPLE_RATE = 16000
 DOUBLE_TAP_WINDOW = 0.4
+START_SOUND_SECONDS = 0.6  # the Tink that confirms recording plays through the speakers, so the microphone hears it
 FN_MASK = Quartz.kCGEventFlagMaskSecondaryFn
 KEYCODE_V = 9
 STOP_TIMEOUT = 2.0  # CoreAudio can deadlock while closing a stream, so never wait longer than this
@@ -49,6 +50,7 @@ stream = None
 recording = False
 fn_down = False
 last_press = 0.0
+ignore_audio_until = 0.0
 lock = threading.Lock()
 model_ready = threading.Event()
 # Starting and stopping the microphone must never wait for the model, so they run on separate threads.
@@ -71,11 +73,13 @@ def hud(state):
 
 
 def on_audio(indata, frames, time_info, status):
+    if time.monotonic() < ignore_audio_until:
+        return
     chunks.append(indata.copy())
 
 
 def start_recording():
-    global stream, recording
+    global stream, recording, ignore_audio_until
     chunks.clear()
     try:
         stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
@@ -83,6 +87,7 @@ def start_recording():
     except Exception:
         recording = False
         raise
+    ignore_audio_until = time.monotonic() + START_SOUND_SECONDS
     play("Tink")
     hud("recording")
     if not model_ready.is_set():
@@ -181,6 +186,8 @@ def on_fn_press():
         if recording:
             recording = False
             jobs.put(stop_recording)
+            last_press = 0.0  # a quick second tap must not turn the stop into a double tap that restarts
+            return
         elif now - last_press <= DOUBLE_TAP_WINDOW:
             recording = True
             jobs.put(start_recording)

@@ -65,6 +65,20 @@ class TestAudioCapture:
         assert "@state:recording" in out
         assert "Merekam..." in out
 
+    def test_the_start_sound_is_not_recorded(self, bisik, monkeypatch):
+        """Regression: the Tink played by the speakers was transcribed as "Tick the Tick the ..."."""
+        now = [100.0]
+        monkeypatch.setattr(bisik.time, "monotonic", lambda: now[0])
+        with mock.patch.object(bisik, "play"):
+            bisik.start_recording()
+        for offset in (0.0, 0.3, 0.59):
+            now[0] = 100.0 + offset
+            bisik.on_audio(np.ones((4, 1), dtype="float32"), 4, None, None)
+        assert bisik.chunks == []
+        now[0] = 100.61
+        bisik.on_audio(np.ones((4, 1), dtype="float32"), 4, None, None)
+        assert len(bisik.chunks) == 1
+
     def test_start_recording_failure_resets_the_recording_flag_and_raises(self, bisik):
         bisik.recording = True
         bisik.sd.InputStream.side_effect = OSError("microphone denied")
@@ -321,11 +335,19 @@ class TestFnDetection:
         assert bisik.recording is False
         assert bisik.jobs.get_nowait() is bisik.stop_recording
 
-    def test_the_stop_tap_counts_as_the_first_tap_of_a_new_double_tap(self, bisik):
-        # Current behavior, pinned on purpose: stopping and tapping again within 0.4s restarts.
+    def test_a_quick_second_tap_after_stopping_does_not_restart(self, bisik):
+        """Regression: stopping with a double tap immediately started a new recording."""
         bisik.recording = True
         self.press(bisik, 200.0)
         self.press(bisik, 200.2)
+        assert bisik.recording is False
+        assert [job.__name__ for job in list(bisik.jobs.queue)] == ["stop_recording"]
+
+    def test_a_double_tap_after_stopping_starts_again(self, bisik):
+        bisik.recording = True
+        self.press(bisik, 200.0)
+        self.press(bisik, 201.0)
+        self.press(bisik, 201.2)
         assert bisik.recording is True
         assert [job.__name__ for job in list(bisik.jobs.queue)] == ["stop_recording", "start_recording"]
 
@@ -483,7 +505,7 @@ class TestEndToEndFlow:
     def test_double_tap_records_and_a_single_tap_transcribes_and_pastes(self, bisik, monkeypatch, hud_on, capsys):
         monkeypatch.setattr(bisik, "play", lambda name: None)
         bisik.mlx_whisper.transcribe.return_value = {"text": "selamat pagi", "language": "id"}
-        ticks = iter([10.0, 10.2, 20.0])
+        ticks = iter([10.0, 10.2, 10.3, 20.0])  # the third is read when the start sound is muted
         monkeypatch.setattr(bisik.time, "monotonic", lambda: next(ticks))
         stream = bisik.sd.InputStream.return_value
 
