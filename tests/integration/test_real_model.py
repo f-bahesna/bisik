@@ -110,12 +110,20 @@ def noise(level):
     return np.random.default_rng(0).normal(0, level, 32000).astype("float32")
 
 
+def hum(level):
+    """Low-passed noise such as a fan, which the model turns into invented sentences with a very low score."""
+    raw = np.convolve(np.random.default_rng(3).normal(0, 1, 32000), np.ones(30) / 30, "same")
+    return (raw / raw.std() * level).astype("float32")
+
+
 @pytest.mark.parametrize(
     "audio",
     [
         pytest.param(np.zeros(32000, dtype="float32"), id="digital-silence"),
         pytest.param(noise(0.001), id="very-quiet-room"),
         pytest.param(noise(0.005), id="quiet-room"),
+        pytest.param(hum(0.01), id="room-hum"),
+        pytest.param(hum(0.02) + hum(0.0), id="loud-room-hum"),
     ],
 )
 def test_silence_and_room_noise_are_never_pasted(bisik, audio):
@@ -143,14 +151,24 @@ def test_quiet_speech_is_still_transcribed(bisik, tmp_path, gain):
 
 @pytest.mark.parametrize(
     ("voice", "closing"),
-    [("Damayanti", "Terima kasih telah menonton"), ("Damayanti", "Selamat menikmati"), ("Samantha", "Thanks for watching")],
+    [
+        ("Damayanti", "Terima kasih telah menonton"),
+        ("Damayanti", "Selamat menikmati"),
+        ("Samantha", "Thanks for watching"),
+    ],
 )
 def test_a_quiet_closing_phrase_after_the_speech_is_not_pasted(bisik, tmp_path, voice, closing):
     """Regression: Whisper adds a stock closing phrase after the speech that the user never said."""
     if voice not in voices():
         pytest.skip(f"voice {voice} is not installed")
-    sentence = "Hello, this is a test of the dictation app." if voice == "Samantha" else "Ini adalah percobaan aplikasi dikte suara."
-    audio = np.concatenate([speak(tmp_path, voice, sentence), np.zeros(8000, dtype="float32"), speak(tmp_path, voice, closing) * 0.01])
+    sentence = (
+        "Hello, this is a test of the dictation app."
+        if voice == "Samantha"
+        else "Ini adalah percobaan aplikasi dikte suara."
+    )
+    audio = np.concatenate(
+        [speak(tmp_path, voice, sentence), np.zeros(8000, dtype="float32"), speak(tmp_path, voice, closing) * 0.01]
+    )
 
     with mock.patch.object(bisik.subprocess, "run") as run, mock.patch.object(bisik, "paste"):
         bisik.transcribe_and_paste(audio)

@@ -15,6 +15,14 @@ from tests.conftest import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fake_recorder(bisik):
+    """Replace the microphone child process, tests of the real Recorder restore bisik.RealRecorder."""
+    bisik.RealRecorder = bisik.Recorder
+    bisik.Recorder = mock.MagicMock(name="Recorder")
+    bisik.Recorder.return_value.stop.return_value = False
+
+
 @pytest.fixture
 def hud_on(monkeypatch):
     monkeypatch.setenv("BISIK_HUD", "1")
@@ -44,22 +52,20 @@ class TestPlayAndHud:
 
 class TestAudioCapture:
     def test_on_audio_stores_a_copy_of_the_buffer(self, bisik):
-        buffer = np.ones((4, 1), dtype="float32")
-        bisik.on_audio(buffer, 4, None, None)
+        buffer = np.ones(4, dtype="float32")
+        bisik.on_audio(buffer)
         buffer[:] = 0
         assert bisik.chunks[0].sum() == 4
 
-    def test_start_recording_opens_a_mono_16k_stream(self, bisik, hud_on, capsys):
+    def test_start_recording_starts_the_microphone_process_and_waits_for_it(self, bisik, hud_on, capsys):
         with mock.patch.object(bisik, "play") as play:
             bisik.chunks.append(np.ones(3))
             bisik.start_recording()
 
-        bisik.sd.InputStream.assert_called_once_with(
-            samplerate=16000, channels=1, dtype="float32", callback=bisik.on_audio
-        )
-        bisik.sd.InputStream.return_value.start.assert_called_once()
+        bisik.Recorder.assert_called_once_with()
+        bisik.Recorder.return_value.wait_until_recording.assert_called_once()
         assert bisik.chunks == []
-        assert bisik.stream is bisik.sd.InputStream.return_value
+        assert bisik.recorder is bisik.Recorder.return_value
         play.assert_called_once_with("Tink")
         out = capsys.readouterr().out
         assert "@state:recording" in out
@@ -73,30 +79,29 @@ class TestAudioCapture:
             bisik.start_recording()
         for offset in (0.0, 0.3, 0.59):
             now[0] = 100.0 + offset
-            bisik.on_audio(np.ones((4, 1), dtype="float32"), 4, None, None)
+            bisik.on_audio(np.ones(4, dtype="float32"))
         assert bisik.chunks == []
         now[0] = 100.61
-        bisik.on_audio(np.ones((4, 1), dtype="float32"), 4, None, None)
+        bisik.on_audio(np.ones(4, dtype="float32"))
         assert len(bisik.chunks) == 1
 
     def test_start_recording_failure_resets_the_recording_flag_and_raises(self, bisik):
         bisik.recording = True
-        bisik.sd.InputStream.side_effect = OSError("microphone denied")
-        with pytest.raises(OSError, match="microphone denied"):
+        bisik.Recorder.return_value.wait_until_recording.side_effect = RuntimeError("microphone denied")
+        with pytest.raises(RuntimeError, match="microphone denied"):
             bisik.start_recording()
         assert bisik.recording is False
+        assert bisik.recorder is None
 
     def test_stop_recording_joins_chunks_and_transcribes(self, bisik, hud_on, capsys):
-        bisik.stream = mock.MagicMock()
-        stream = bisik.stream
-        bisik.chunks[:] = [np.ones((2, 1), dtype="float32"), np.full((3, 1), 2, dtype="float32")]
+        bisik.recorder = bisik.Recorder.return_value
+        bisik.chunks[:] = [np.ones(2, dtype="float32"), np.full(3, 2, dtype="float32")]
 
         with mock.patch.object(bisik, "play") as play:
             bisik.stop_recording()
 
-        stream.stop.assert_called_once()
-        stream.close.assert_called_once()
-        assert bisik.stream is None
+        bisik.Recorder.return_value.stop.assert_called_once()
+        assert bisik.recorder is None
         play.assert_called_once_with("Pop")
         job = bisik.model_jobs.get_nowait()
         assert job.func is bisik.transcribe_and_paste
@@ -106,31 +111,88 @@ class TestAudioCapture:
         assert "Berhenti merekam" in out
 
     def test_stop_recording_without_audio_sends_an_empty_array(self, bisik):
-        bisik.stream = mock.MagicMock()
+        bisik.recorder = bisik.Recorder.return_value
         with mock.patch.object(bisik, "play"):
             bisik.stop_recording()
         assert len(bisik.model_jobs.get_nowait().args[0]) == 0
 
-    def test_a_microphone_that_hangs_on_close_does_not_block_transcription(self, bisik, monkeypatch, capsys):
-        monkeypatch.setattr(bisik, "STOP_TIMEOUT", 0.05)
-        release = bisik.threading.Event()
-        bisik.stream = mock.MagicMock()
-        bisik.stream.stop.side_effect = lambda: release.wait(5)
-        bisik.chunks[:] = [np.ones((16000, 1), dtype="float32")]
-        try:
+    def test_a_microphone_process_that_had_to_be_killed_still_gets_its_audio_transcribed(self, bisik, capsys):
+        """Regression: CoreAudio deadlocked on close and no later fn press worked."""
+        bisik.recorder = bisik.Recorder.return_value
+        bisik.Recorder.return_value.stop.return_value = True
+        bisik.chunks[:] = [np.ones(16000, dtype="float32")]
+        with mock.patch.object(bisik, "play"):
             bisik.stop_recording()
-            assert bisik.stream is None
-            assert not bisik.model_jobs.empty()
-            assert "macet" in capsys.readouterr().out
-        finally:
-            release.set()
+        assert bisik.recorder is None
+        assert len(bisik.model_jobs.get_nowait().args[0]) == 16000
+        assert "macet" in capsys.readouterr().out
 
-    def test_stop_recording_does_nothing_when_no_stream_was_opened(self, bisik):
-        bisik.stream = None
+    def test_stop_recording_does_nothing_when_no_recorder_was_started(self, bisik):
+        bisik.recorder = None
         with mock.patch.object(bisik, "play") as play:
             bisik.stop_recording()
         assert bisik.model_jobs.empty()
         play.assert_not_called()
+
+
+class TestRecorder:
+    """The real Recorder against a fake child process."""
+
+    @pytest.fixture
+    def process(self, bisik):
+        process = mock.MagicMock(name="process")
+        process.poll.return_value = None
+        with mock.patch.object(bisik.subprocess, "Popen", return_value=process) as popen:
+            process.popen = popen
+            yield process
+
+    def test_samples_are_rebuilt_even_when_the_pipe_splits_a_float(self, bisik, process):
+        data = np.arange(4, dtype="float32").tobytes()
+        process.stdout.read1.side_effect = [data[:6], data[6:], b""]
+        recorder = bisik.RealRecorder()
+        recorder.reader.join(2)
+        assert np.concatenate(bisik.chunks).tolist() == [0, 1, 2, 3]
+
+    def test_the_child_records_at_the_whisper_sample_rate(self, bisik, process):
+        process.stdout.read1.side_effect = [b""]
+        bisik.RealRecorder().reader.join(2)
+        command = process.popen.call_args.args[0]
+        assert command[0] == bisik.sys.executable
+        assert command[-1] == "16000"
+
+    def test_a_child_that_exits_at_once_reports_why(self, bisik, process):
+        process.stdout.read1.side_effect = [b""]
+        process.poll.return_value = 1
+        process.stderr.read.return_value = b"Traceback\nPortAudioError: permission denied\n"
+        recorder = bisik.RealRecorder()
+        with pytest.raises(RuntimeError, match="permission denied"):
+            recorder.wait_until_recording()
+
+    def test_a_child_that_never_delivers_audio_is_killed(self, bisik, process, monkeypatch):
+        monkeypatch.setattr(bisik, "START_TIMEOUT", 0.05)
+        release = bisik.threading.Event()
+        process.stdout.read1.side_effect = lambda size: release.wait(2) and b""
+        recorder = bisik.RealRecorder()
+        try:
+            with pytest.raises(RuntimeError, match="tidak merespons"):
+                recorder.wait_until_recording()
+            process.kill.assert_called_once()
+        finally:
+            release.set()
+
+    def test_stop_asks_the_child_to_exit(self, bisik, process):
+        process.stdout.read1.side_effect = [b""]
+        recorder = bisik.RealRecorder()
+        assert recorder.stop() is False
+        process.terminate.assert_called_once()
+        process.kill.assert_not_called()
+
+    def test_stop_kills_a_child_that_ignores_the_request(self, bisik, process):
+        process.stdout.read1.side_effect = [b""]
+        process.wait.side_effect = [bisik.subprocess.TimeoutExpired("recorder", 2), 0]
+        recorder = bisik.RealRecorder()
+        assert recorder.stop() is True
+        process.kill.assert_called_once()
 
 
 class TestTranscribeAndPaste:
@@ -157,7 +219,7 @@ class TestTranscribeAndPaste:
             bisik.transcribe_and_paste(self.SECOND)
 
         bisik.mlx_whisper.transcribe.assert_called_once_with(
-            self.SECOND, path_or_hf_repo=bisik.MODEL, language=bisik.LANGUAGE, word_timestamps=True
+            self.SECOND, path_or_hf_repo=bisik.MODEL, language=bisik.LANGUAGE
         )
         run.assert_called_once_with(["pbcopy"], input=b"Halo dunia", check=True)
         paste.assert_called_once()
@@ -182,6 +244,26 @@ class TestTranscribeAndPaste:
 class TestSilenceAndHallucinations:
     def audio(self, level):
         return np.full(16000, level, dtype="float32")
+
+    def speech(self, level):
+        """Loud and soft 100 ms frames alternating, the way syllables and pauses vary in real speech."""
+        frames = np.where(np.arange(20) % 2 == 0, level, level / 5)
+        return np.repeat(frames, 1600).astype("float32")
+
+    def test_a_stock_phrase_from_loud_steady_noise_is_dropped(self, bisik, capsys):
+        """Regression: a fan at normal loudness became "Thank you." and was pasted."""
+        bisik.mlx_whisper.transcribe.return_value = {"text": "Thank you.", "language": "en"}
+        noise = np.random.default_rng(0).normal(0, 0.02, 32000).astype("float32")
+        with mock.patch.object(bisik, "paste") as paste, mock.patch.object(bisik.subprocess, "run") as run:
+            bisik.transcribe_and_paste(noise)
+        run.assert_not_called()
+        paste.assert_not_called()
+
+    def test_steady_and_varying_signals_are_told_apart(self, bisik):
+        assert bisik.is_stationary(np.random.default_rng(1).normal(0, 0.03, 48000).astype("float32"))
+        assert not bisik.is_stationary(self.speech(0.05))
+        assert not bisik.is_stationary(np.ones(1000, dtype="float32"))  # too short to judge
+        assert not bisik.is_stationary(np.zeros(32000, dtype="float32"))
 
     def test_a_dead_microphone_never_reaches_the_model(self, bisik, hud_on, capsys):
         bisik.transcribe_and_paste(self.audio(0.0))
@@ -221,7 +303,7 @@ class TestSilenceAndHallucinations:
     def test_the_same_phrase_at_normal_volume_is_real_speech(self, bisik):
         bisik.mlx_whisper.transcribe.return_value = {"text": "Thank you.", "language": "en"}
         with mock.patch.object(bisik, "paste") as paste, mock.patch.object(bisik.subprocess, "run") as run:
-            bisik.transcribe_and_paste(self.audio(0.05))
+            bisik.transcribe_and_paste(self.speech(0.05))
         run.assert_called_once_with(["pbcopy"], input=b"Thank you.", check=True)
         paste.assert_called_once()
 
@@ -251,9 +333,7 @@ class TestTrailingHallucination:
     def result(self, closing):
         """A transcription whose last words start at second 3, where the quiet tail begins."""
         spoken = [{"word": " Tulis", "start": 0.0, "end": 1.0}, {"word": " ulang", "start": 1.0, "end": 2.0}]
-        extra = [
-            {"word": f" {w}", "start": 3.0 + i * 0.3, "end": 3.3 + i * 0.3} for i, w in enumerate(closing.split())
-        ]
+        extra = [{"word": f" {w}", "start": 3.0 + i * 0.3, "end": 3.3 + i * 0.3} for i, w in enumerate(closing.split())]
         text = "Tulis ulang " + closing
         return {"text": text, "language": "id", "segments": [{"words": spoken + extra}]}
 
@@ -278,9 +358,164 @@ class TestTrailingHallucination:
         run = self.run(bisik, np.concatenate([self.SPEECH, self.QUIET_TAIL]), result)
         run.assert_called_once_with(["pbcopy"], input=b"Tulis ulang terima kasih telah menonton", check=True)
 
-    def test_word_timestamps_are_requested_from_the_model(self, bisik):
-        self.run(bisik, self.SPEECH, {"text": "Halo", "language": "id"})
+    def test_word_timings_are_only_requested_when_the_text_ends_with_a_stock_phrase(self, bisik):
+        self.run(bisik, self.SPEECH, {"text": "Halo dunia", "language": "id"})
+        bisik.mlx_whisper.transcribe.assert_called_once()
+        assert "word_timestamps" not in bisik.mlx_whisper.transcribe.call_args.kwargs
+
+        bisik.mlx_whisper.transcribe.reset_mock()
+        self.run(bisik, np.concatenate([self.SPEECH, self.QUIET_TAIL]), self.result("terima kasih"))
+        assert bisik.mlx_whisper.transcribe.call_count == 2
         assert bisik.mlx_whisper.transcribe.call_args.kwargs["word_timestamps"] is True
+
+    @pytest.mark.parametrize(
+        ("text", "expected"), [("Halo, terima kasih.", True), ("tahu", False), ("Bye", True), ("Selamat", False)]
+    )
+    def test_only_text_ending_in_a_whole_stock_phrase_triggers_the_second_pass(self, bisik, text, expected):
+        assert bisik.ends_with_stock_phrase(text) is expected
+
+
+class TestConfidence:
+    SECOND = np.full(16000, 0.1, dtype="float32")
+
+    def segment(self, text, logprob=-0.3, compression=1.0):
+        return {"text": text, "avg_logprob": logprob, "compression_ratio": compression}
+
+    def run(self, bisik, result, capsys):
+        bisik.mlx_whisper.transcribe.return_value = result
+        with mock.patch.object(bisik, "paste"), mock.patch.object(bisik.subprocess, "run") as run:
+            bisik.transcribe_and_paste(self.SECOND)
+        return run, capsys.readouterr().out
+
+    def test_invented_text_from_noise_is_not_pasted(self, bisik, capsys):
+        """Regression: noise became "Would not review today... Learn more from www.start13d..." after 53 seconds."""
+        result = {
+            "text": " Would not review today",
+            "language": "en",
+            "segments": [self.segment(" Would not review today", -3.6)],
+        }
+        run, out = self.run(bisik, result, capsys)
+        run.assert_not_called()
+        assert "berkeyakinan rendah" in out
+        assert "Tidak ada suara terdeteksi" in out
+
+    def test_only_the_unsure_segment_is_dropped(self, bisik, capsys):
+        result = {
+            "text": " Jalankan tesnya. Ithan.",
+            "language": "id",
+            "segments": [self.segment(" Jalankan tesnya."), self.segment(" Ithan.", -4.0)],
+        }
+        run, _ = self.run(bisik, result, capsys)
+        run.assert_called_once_with(["pbcopy"], input=b"Jalankan tesnya.", check=True)
+
+    def test_a_decoding_loop_is_dropped(self, bisik, capsys):
+        result = {
+            "text": " Tick the Tick the",
+            "language": "en",
+            "segments": [self.segment(" Tick the Tick the", -0.5, 3.1)],
+        }
+        run, _ = self.run(bisik, result, capsys)
+        run.assert_not_called()
+
+    def test_hard_but_real_speech_is_kept(self, bisik, capsys):
+        result = {"text": " Halo dunia", "language": "id", "segments": [self.segment(" Halo dunia", -0.9, 2.0)]}
+        run, _ = self.run(bisik, result, capsys)
+        run.assert_called_once_with(["pbcopy"], input=b"Halo dunia", check=True)
+
+    def test_the_log_reports_how_long_the_model_took(self, bisik, capsys):
+        _, out = self.run(bisik, {"text": "Halo", "language": "id"}, capsys)
+        assert "Transkripsi " in out and "detik untuk audio 1.0 detik" in out
+
+
+class TestWatchdogAndKeepWarm:
+    def test_a_stuck_transcription_restarts_the_engine(self, bisik, hud_on, capsys):
+        with mock.patch.object(bisik.os, "_exit") as exit_:
+            bisik.abort_stuck_transcription()
+        exit_.assert_called_once_with(75)
+        out = capsys.readouterr().out
+        assert "macet" in out
+        assert out.rstrip().endswith("@state:idle")
+
+    def test_the_timeout_grows_with_the_length_of_the_audio(self, bisik):
+        with mock.patch.object(bisik.threading, "Timer") as timer:
+            bisik.transcribe_and_paste(np.zeros(16000 * 60, dtype="float32"))
+        assert timer.call_args.args[0] == bisik.TRANSCRIBE_TIMEOUT + 60
+        timer.return_value.start.assert_called_once()
+        timer.return_value.cancel.assert_called_once()
+
+    def test_a_finished_transcription_cancels_the_watchdog(self, bisik):
+        bisik.mlx_whisper.transcribe.side_effect = RuntimeError("boom")
+        with mock.patch.object(bisik.threading, "Timer") as timer, pytest.raises(RuntimeError):
+            bisik.transcribe_and_paste(np.full(16000, 0.1, dtype="float32"))
+        timer.return_value.cancel.assert_called_once()
+
+    def run_keep_warm(self, bisik, monkeypatch):
+        """Run one idle period of keep_warm, then stop the endless loop."""
+        monkeypatch.setattr(bisik.time, "sleep", mock.Mock(side_effect=[None, StopIteration]))
+        with pytest.raises(StopIteration):
+            bisik.keep_warm()
+
+    def test_an_idle_ready_model_is_touched(self, bisik, monkeypatch):
+        bisik.model_ready.set()
+        self.run_keep_warm(bisik, monkeypatch)
+        assert bisik.model_jobs.get_nowait() is bisik.touch_model
+
+    @pytest.mark.parametrize("state", ["loading", "busy", "recording"])
+    def test_the_model_is_left_alone_while_it_is_not_idle(self, bisik, monkeypatch, state):
+        if state != "loading":
+            bisik.model_ready.set()
+        if state == "busy":
+            bisik.model_jobs.put(lambda: None)
+        if state == "recording":
+            bisik.recording = True
+        self.run_keep_warm(bisik, monkeypatch)
+        assert bisik.touch_model not in list(bisik.model_jobs.queue)
+
+
+class TestMicrophoneLost:
+    def test_a_microphone_that_dies_mid_recording_resets_the_overlay(self, bisik, hud_on, capsys):
+        lost = bisik.Recorder.return_value
+        bisik.recorder, bisik.recording = lost, True
+        bisik.on_recorder_lost(lost)
+        assert bisik.recording is False
+        out = capsys.readouterr().out
+        assert "berhenti tiba-tiba" in out
+        assert out.rstrip().endswith("@state:idle")
+
+    def test_an_old_recorder_ending_does_not_touch_the_current_recording(self, bisik, capsys):
+        bisik.recorder, bisik.recording = bisik.Recorder.return_value, True
+        bisik.on_recorder_lost(mock.MagicMock())
+        assert bisik.recording is True
+        assert capsys.readouterr().out == ""
+
+    def test_the_next_recording_reaps_the_dead_recorder(self, bisik):
+        dead = mock.MagicMock()
+        bisik.recorder = dead
+        with mock.patch.object(bisik, "play"):
+            bisik.start_recording()
+        dead.stop.assert_called_once()
+        assert bisik.recorder is bisik.Recorder.return_value
+
+    def test_the_reader_reports_a_child_that_ends_after_delivering_audio(self, bisik):
+        process = mock.MagicMock()
+        process.stdout.read1.side_effect = [np.zeros(4, dtype="float32").tobytes(), b""]
+        with (
+            mock.patch.object(bisik.subprocess, "Popen", return_value=process),
+            mock.patch.object(bisik, "on_recorder_lost") as lost,
+        ):
+            recorder = bisik.RealRecorder()
+            recorder.reader.join(2)
+        lost.assert_called_once_with(recorder)
+
+    def test_a_denied_microphone_is_not_reported_as_lost(self, bisik):
+        process = mock.MagicMock()
+        process.stdout.read1.side_effect = [b""]
+        with (
+            mock.patch.object(bisik.subprocess, "Popen", return_value=process),
+            mock.patch.object(bisik, "on_recorder_lost") as lost,
+        ):
+            bisik.RealRecorder().reader.join(2)
+        lost.assert_not_called()
 
 
 class TestPaste:
@@ -449,15 +684,16 @@ class TestStartup:
             bisik.main()
         bisik.Quartz.CFRunLoopRun.assert_not_called()
 
-    def test_main_starts_both_workers_queues_warm_up_and_runs_the_loop(self, bisik, capsys):
+    def test_main_starts_the_workers_queues_warm_up_and_runs_the_loop(self, bisik, capsys):
         with mock.patch.object(bisik.threading, "Thread") as thread:
             bisik.main()
 
         assert thread.call_args_list == [
             mock.call(target=bisik.worker, args=(bisik.jobs,), daemon=True),
             mock.call(target=bisik.worker, args=(bisik.model_jobs,), daemon=True),
+            mock.call(target=bisik.keep_warm, daemon=True),
         ]
-        assert thread.return_value.start.call_count == 2
+        assert thread.return_value.start.call_count == 3
         assert bisik.model_jobs.get_nowait() is bisik.warm_up
         assert bisik.jobs.empty()
         quartz = bisik.Quartz
@@ -505,14 +741,13 @@ class TestEndToEndFlow:
     def test_double_tap_records_and_a_single_tap_transcribes_and_pastes(self, bisik, monkeypatch, hud_on, capsys):
         monkeypatch.setattr(bisik, "play", lambda name: None)
         bisik.mlx_whisper.transcribe.return_value = {"text": "selamat pagi", "language": "id"}
-        ticks = iter([10.0, 10.2, 10.3, 20.0])  # the third is read when the start sound is muted
+        ticks = iter([10.0, 10.2, 10.3, 20.0, 20.5, 20.9])  # start sound mute, then fn, then the transcription timer
         monkeypatch.setattr(bisik.time, "monotonic", lambda: next(ticks))
-        stream = bisik.sd.InputStream.return_value
 
         def fake_start():
-            bisik.chunks.append(np.ones((16000, 1), dtype="float32"))
+            bisik.chunks.append(np.ones(16000, dtype="float32"))
 
-        stream.start.side_effect = fake_start
+        bisik.Recorder.return_value.wait_until_recording.side_effect = fake_start
 
         with mock.patch.object(bisik.subprocess, "run") as run:
             bisik.on_fn_press()  # first tap
@@ -531,7 +766,7 @@ class TestEndToEndFlow:
 
     def test_denied_microphone_leaves_the_app_ready_for_another_try(self, bisik, monkeypatch, capsys):
         monkeypatch.setattr(bisik, "play", lambda name: None)
-        bisik.sd.InputStream.side_effect = OSError("denied")
+        bisik.Recorder.return_value.wait_until_recording.side_effect = OSError("denied")
         ticks = iter([10.0, 10.1, 30.0, 30.1])
         monkeypatch.setattr(bisik.time, "monotonic", lambda: next(ticks))
 
@@ -563,15 +798,15 @@ class TestRecordingDoesNotWaitForTheModel:
             while not bisik.jobs.empty():  # only the audio worker runs
                 bisik.jobs.get_nowait()()
 
-        bisik.sd.InputStream.return_value.start.assert_called_once()
+        bisik.Recorder.return_value.wait_until_recording.assert_called_once()
         assert "@state:recording" in capsys.readouterr().out
         assert bisik.model_jobs.qsize() == 1
         bisik.mlx_whisper.transcribe.assert_not_called()
 
     def test_stopping_while_the_model_loads_queues_transcription_behind_it(self, bisik):
         bisik.model_jobs.put(bisik.warm_up)
-        bisik.stream = mock.MagicMock()
-        bisik.chunks.append(np.full((16000, 1), 0.1, dtype="float32"))
+        bisik.recorder = bisik.Recorder.return_value
+        bisik.chunks.append(np.full(16000, 0.1, dtype="float32"))
 
         with mock.patch.object(bisik, "play"):
             bisik.stop_recording()
@@ -592,7 +827,7 @@ class TestRecordingDoesNotWaitForTheModel:
             warm_up_started.set()
             release_warm_up.wait(5)
 
-        bisik.sd.InputStream.return_value.start.side_effect = recorded.set
+        bisik.Recorder.return_value.wait_until_recording.side_effect = recorded.set
         for queue_ in (bisik.jobs, bisik.model_jobs):
             threading.Thread(target=bisik.worker, args=(queue_,), daemon=True).start()
         with mock.patch.object(bisik, "play"):
